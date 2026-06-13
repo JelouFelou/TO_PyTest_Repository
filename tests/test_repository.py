@@ -151,6 +151,29 @@ def test_update_stats_persists_and_replaces_counters(repo):
     assert repo.get_ue(1).stats[9] == updated
 
 
+def test_update_missing_bearer_raises_error(repo):
+    repo.attach_ue(1)
+
+    with pytest.raises(ValueError, match="Bearer not found"):
+        repo.update_bearer(1, BearerConfig(bearer_id=2, protocol="tcp"))
+
+
+def test_update_stats_for_missing_bearer_raises_error(repo):
+    repo.attach_ue(1)
+    stats = ThroughputStats(bearer_id=2, ue_id=1, bytes_tx=100)
+
+    with pytest.raises(ValueError, match="Bearer not found"):
+        repo.update_stats(1, stats)
+
+
+def test_update_stats_with_mismatched_ue_id_raises_error(repo):
+    repo.attach_ue(1)
+    stats = ThroughputStats(bearer_id=9, ue_id=2, bytes_tx=100)
+
+    with pytest.raises(ValueError, match="UE ID mismatch"):
+        repo.update_stats(1, stats)
+
+
 def test_reset_all_removes_every_ue(repo):
     for ue_id in (1, 2, 3):
         repo.attach_ue(ue_id)

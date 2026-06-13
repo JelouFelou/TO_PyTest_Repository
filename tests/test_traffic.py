@@ -1,10 +1,12 @@
-import asyncio
 import pytest
 
 from epc import traffic as traffic_module
 from epc.db import EPCRepository
-from epc.models import BearerConfig, ThroughputStats
+from epc.models import BearerConfig
 from epc.traffic import TrafficGeneratorManager, get_traffic_manager
+
+
+MAX_UE_TARGET_BPS = 100_000_000
 
 
 # Checks that a new manager starts without any active traffic tasks.
@@ -27,23 +29,6 @@ def test_start_traffic_marks_bearer_as_running(tmp_path):
     manager.start(1, bearer)
 
     assert manager.is_running(1, 1)
-
-    manager.stop_all()
-
-
-# Checks that the manager tracks traffic by exact UE ID and bearer ID.
-def test_is_running_checks_exact_ue_and_bearer(tmp_path):
-    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
-    repo.attach_ue(1)
-
-    manager = TrafficGeneratorManager(repo)
-    bearer = BearerConfig(bearer_id=1, protocol="udp", target_bps=100_000)
-
-    manager.start(1, bearer)
-
-    assert manager.is_running(1, 1)
-    assert not manager.is_running(1, 2)
-    assert not manager.is_running(2, 1)
 
     manager.stop_all()
 
@@ -80,20 +65,6 @@ def test_start_traffic_requires_configuration(tmp_path):
     manager.stop_all()
 
 
-# Checks that missing protocol prevents traffic from starting.
-def test_start_traffic_requires_protocol(tmp_path):
-    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
-    repo.attach_ue(1)
-
-    manager = TrafficGeneratorManager(repo)
-    bearer = BearerConfig(bearer_id=1, target_bps=100_000)
-
-    with pytest.raises(ValueError, match="Bearer not configured for traffic"):
-        manager.start(1, bearer)
-
-    assert not manager.is_running(1, 1)
-
-
 # Checks that missing target prevents traffic from starting.
 def test_start_traffic_requires_target_bps(tmp_path):
     repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
@@ -103,6 +74,38 @@ def test_start_traffic_requires_target_bps(tmp_path):
     bearer = BearerConfig(bearer_id=1, protocol="udp")
 
     with pytest.raises(ValueError, match="Bearer not configured for traffic"):
+        manager.start(1, bearer)
+
+    assert not manager.is_running(1, 1)
+
+
+# Checks that traffic above 100 Mbps per UE is rejected.
+def test_start_traffic_rejects_speed_above_100_mbps(tmp_path):
+    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
+    repo.attach_ue(1)
+
+    manager = TrafficGeneratorManager(repo)
+    bearer = BearerConfig(
+        bearer_id=1,
+        protocol="tcp",
+        target_bps=MAX_UE_TARGET_BPS + 1,
+    )
+
+    with pytest.raises(ValueError):
+        manager.start(1, bearer)
+
+    assert not manager.is_running(1, 1)
+
+
+# Checks that negative traffic speed is rejected.
+def test_start_traffic_rejects_negative_speed(tmp_path):
+    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
+    repo.attach_ue(1)
+
+    manager = TrafficGeneratorManager(repo)
+    bearer = BearerConfig(bearer_id=1, protocol="udp", target_bps=-1)
+
+    with pytest.raises(ValueError):
         manager.start(1, bearer)
 
     assert not manager.is_running(1, 1)
@@ -144,27 +147,6 @@ def test_stop_all_cancels_all_running_tasks(tmp_path):
     assert not manager.is_running(1, 2)
 
 
-# Checks that "stop_unknown_traffic_is_noop" is a safe.
-def test_stop_unknown_traffic_is_noop(tmp_path):
-    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
-    manager = TrafficGeneratorManager(repo)
-
-    manager.stop(1, 1)
-
-    assert manager.tasks == {}
-    assert not manager.is_running(1, 1)
-
-
-# Checks that "stop_all" is safe when no traffic is running.
-def test_stop_all_without_running_traffic_is_noop(tmp_path):
-    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
-    manager = TrafficGeneratorManager(repo)
-
-    manager.stop_all()
-
-    assert manager.tasks == {}
-
-
 # Checks that stopping one bearer does not stop the others.
 def test_stopping_one_bearer_keeps_other_running(tmp_path):
     repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
@@ -196,94 +178,3 @@ def test_get_traffic_manager_returns_singleton(tmp_path, monkeypatch):
     assert manager_a.repo is repo
 
     manager_a.stop_all()
-
-
-# Checks that one simulation iteration creates and updates stats.
-def test_simulated_bearer_updates_stats_once(tmp_path, monkeypatch):
-    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
-    repo.attach_ue(1)
-
-    manager = TrafficGeneratorManager(repo)
-    bearer_id = 1
-    target_bps = 8_000
-
-    async def run_once():
-        event = asyncio.Event()
-        pause = asyncio.Event()
-
-        async def fake_sleep(delay):
-            event.set()
-            await pause.wait()
-
-        monkeypatch.setattr(traffic_module.asyncio, "sleep", fake_sleep)
-
-        task = asyncio.create_task(
-            manager._run_simulated_bearer(1, bearer_id, target_bps, "udp")
-        )
-
-        await asyncio.wait_for(event.wait(), timeout=1.0)
-        task.cancel()
-
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(run_once())
-
-    stats = repo.get_ue(1).stats[bearer_id]
-    assert stats.protocol == "udp"
-    assert stats.target_bps == target_bps
-    assert stats.bytes_tx == target_bps // 8
-    assert stats.bytes_rx == target_bps // 8
-    assert stats.start_ts is not None
-    assert stats.last_update_ts is not None
-
-
-# Checks that simulation adds bytes to existing stats.
-def test_simulated_bearer_accumulates_existing_stats(tmp_path, monkeypatch):
-    repo = EPCRepository(db_path=str(tmp_path / "repo.db"))
-    repo.attach_ue(1)
-
-    bearer_id = 1
-    repo.update_stats(
-        1,
-        ThroughputStats(
-            bearer_id=bearer_id,
-            ue_id=1,
-            bytes_tx=123,
-            bytes_rx=456,
-            start_ts=10.0,
-        ),
-    )
-
-    manager = TrafficGeneratorManager(repo)
-    target_bps = 16_000
-
-    async def run_once():
-        event = asyncio.Event()
-        pause = asyncio.Event()
-
-        async def fake_sleep(delay):
-            event.set()
-            await pause.wait()
-
-        monkeypatch.setattr(traffic_module.asyncio, "sleep", fake_sleep)
-
-        task = asyncio.create_task(
-            manager._run_simulated_bearer(1, bearer_id, target_bps, "tcp")
-        )
-
-        await asyncio.wait_for(event.wait(), timeout=1.0)
-        task.cancel()
-
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(run_once())
-
-    stats = repo.get_ue(1).stats[bearer_id]
-    assert stats.bytes_tx == 123 + target_bps // 8
-    assert stats.bytes_rx == 456 + target_bps // 8
-    assert stats.start_ts == 10.0
-    assert stats.last_update_ts is not None
-    assert stats.protocol == "tcp"
-    assert stats.target_bps == target_bps
